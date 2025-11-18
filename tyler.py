@@ -1,10 +1,16 @@
 """
-Tyler Durden Telegram Bot
+Tyler Durden Telegram Bot - Improved Version
+
+Улучшения:
+- Умное управление контекстом с автоматической очисткой
+- Двойной контроль: по токенам и по количеству сообщений
+- Сохранение последних N пар сообщений
+- Логирование управления памятью
 
 Стоимость запросов:
-Цены в коде (строки ~42-44) для gpt-4o-mini примерные.
+Цены в коде (строки ~50-52) для gpt-4o-mini примерные.
 Актуальные цены проверяй на: https://proxyapi.ru/pricing
-Текущий курс доллара обнови в переменной usd_to_rub (строка ~45)
+Текущий курс доллара обнови в переменной usd_to_rub (строка ~53)
 """
 
 import os
@@ -14,6 +20,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import aiohttp
 from collections import defaultdict
+from datetime import datetime
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -34,44 +41,82 @@ CONTEXT_TOKEN_LIMIT = int(os.getenv('CONTEXT_TOKEN_LIMIT', '4000'))  # Лими�
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
-# Максимальное количество сообщений в истории
-MAX_HISTORY = 10
+# Максимальное количество пар сообщений в истории (user-assistant)
+MAX_HISTORY_PAIRS = 15  # 15 пар = 30 сообщений + системный промпт
+
+
+# Это примерно 10-12 минут диалога
 
 
 def estimate_tokens(text: str) -> int:
-    """Примерный подсчёт токенов (1 токен ≈ 4 символа для русского)"""
+    """
+    Примерный подсчёт токенов для русского текста
+    1 токен ≈ 3.5 символа для русского языка
+    Для английского обычно 1 токен ≈ 4 символа
+    """
     return len(text) // 3
 
 
-def trim_context_by_tokens(messages: list, token_limit: int) -> list:
-    """Обрезаем контекст до лимита токенов, сохраняя системный промпт"""
+def trim_context_smart(messages: list, token_limit: int) -> list:
+    """
+    Умная обрезка контекста с двойным контролем:
+
+    1. Ограничение по количеству пар сообщений (MAX_HISTORY_PAIRS)
+       - Предотвращает бесконечный рост истории
+       - Удаляет самые старые сообщения
+
+    2. Ограничение по токенам (token_limit)
+       - Предотвращает превышение лимита API
+       - Обрезает с начала если всё ещё превышен лимит
+
+    3. Системный промпт ВСЕГДА сохраняется
+
+    Возвращает: список сообщений, готовый для отправки в API
+    """
     if not messages:
         return messages
 
-    # Системный промпт всегда сохраняем
+    # Системный промпт всегда сохраняем (первое сообщение)
     system_prompt = messages[0]
     user_messages = messages[1:]
 
-    total_tokens = estimate_tokens(system_prompt['content'])
-    trimmed_messages = [system_prompt]
+    # ЭТАП 1: Обрезка по количеству пар сообщений
+    max_messages = MAX_HISTORY_PAIRS * 2
+    if len(user_messages) > max_messages:
+        removed_count = len(user_messages) - max_messages
+        user_messages = user_messages[-max_messages:]
+        logger.info(f'🗑️ Удалено старых сообщений: {removed_count}. Осталось пар: {len(user_messages) // 2}')
 
-    # Добавляем сообщения с конца (самые свежие)
+    # ЭТАП 2: Обрезка по токенам (если всё ещё превышен лимит)
+    system_tokens = estimate_tokens(system_prompt['content'])
+    total_tokens = system_tokens
+    trimmed_messages = []
+
+    # Идём с конца (самые свежие сообщения важнее)
     for msg in reversed(user_messages):
         msg_tokens = estimate_tokens(msg['content'])
+
         if total_tokens + msg_tokens > token_limit:
+            logger.warning(f'⚠️ Достигнут лимит токенов ({token_limit}). Обрезаем старые сообщения.')
             break
-        trimmed_messages.insert(1, msg)  # Вставляем после системного промпта
+
+        trimmed_messages.insert(0, msg)
         total_tokens += msg_tokens
 
-    logger.info(f'📊 Контекст: {len(trimmed_messages) - 1} сообщений, ~{total_tokens} токенов')
-    return trimmed_messages
+    # Собираем финальный список
+    final_messages = [system_prompt] + trimmed_messages
+
+    pairs_count = len(trimmed_messages) // 2
+    logger.info(f'📊 Контекст: {pairs_count} пар сообщений, ~{total_tokens} токенов (лимит: {token_limit})')
+
+    return final_messages
 
 
 async def send_to_chatgpt(messages: list) -> str:
     """Отправка запроса к ChatGPT через ProxyAPI"""
 
-    # Обрезаем контекст по лимиту токенов
-    messages = trim_context_by_tokens(messages, CONTEXT_TOKEN_LIMIT)
+    # Применяем умную обрезку контекста
+    messages = trim_context_smart(messages, CONTEXT_TOKEN_LIMIT)
 
     headers = {
         'Authorization': f'Bearer {PROXYAPI_KEY}',
@@ -125,7 +170,10 @@ async def send_to_chatgpt(messages: list) -> str:
 
 
 def get_user_history(user_id: int) -> list:
-    """Получение или создание истории чата пользователя"""
+    """
+    Получение или создание истории чата пользователя
+    История автоматически создаётся с системным промптом при первом обращении
+    """
     if not user_chats[user_id]:
         user_chats[user_id] = [
             {
@@ -231,10 +279,6 @@ def get_user_history(user_id: int) -> list:
 ✅ Иногда давай план сразу
 ✅ Будь непредсказуемым
 ✅ Используй эмоции
-
-ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ:
-
-ПРИМЕРЫ:
 
 ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ:
 
@@ -404,13 +448,36 @@ def get_user_history(user_id: int) -> list:
 
 
 def add_to_history(user_id: int, role: str, content: str):
-    """Добавление сообщения в историю"""
+    """
+    Добавление сообщения в историю
+    Автоматически обрезается при достижении лимита в функции trim_context_smart
+    """
     history = get_user_history(user_id)
     history.append({'role': role, 'content': content})
 
-    # Ограничиваем размер истории
-    if len(history) > MAX_HISTORY + 1:
-        user_chats[user_id] = [history[0]] + history[-(MAX_HISTORY):]
+    # Логируем размер истории после добавления
+    pairs_count = (len(history) - 1) // 2
+    logger.debug(f'📝 История пользователя {user_id}: {pairs_count} пар сообщений')
+
+
+def get_user_stats(user_id: int) -> dict:
+    """Получение статистики по пользователю"""
+    history = user_chats.get(user_id, [])
+    if len(history) <= 1:
+        return {
+            'messages': 0,
+            'pairs': 0,
+            'tokens': 0
+        }
+
+    messages = history[1:]  # Без системного промпта
+    total_tokens = sum(estimate_tokens(msg['content']) for msg in history)
+
+    return {
+        'messages': len(messages),
+        'pairs': len(messages) // 2,
+        'tokens': total_tokens
+    }
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,6 +494,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 /clear - Стереть историю
 /help - Что я умею
+/stats - Статистика диалога
 
 Ну чё, в чём проблема?
     """
@@ -458,11 +526,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🗣️ Общение (девушки, друзья)
 
 /clear - Новый разговор
+/stats - Статистика диалога
 /start - В начало
 
 Всё. Хватит читать. Действуй.
     """
     await update.message.reply_text(help_message.strip())
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику диалога"""
+    user_id = update.effective_user.id
+    stats = get_user_stats(user_id)
+
+    stats_message = f"""
+📊 Статистика твоего диалога:
+
+💬 Всего сообщений: {stats['messages']}
+🔄 Пар диалога: {stats['pairs']}
+🎯 Примерно токенов: {stats['tokens']}
+📏 Лимит токенов: {CONTEXT_TOKEN_LIMIT}
+🗂️ Макс. пар в памяти: {MAX_HISTORY_PAIRS}
+
+Контекст автоматически очищается при превышении лимитов.
+    """
+    await update.message.reply_text(stats_message.strip())
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,6 +559,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id in user_chats:
         del user_chats[user_id]
+        logger.info(f'🗑️ История пользователя {user_id} очищена')
 
     await update.message.reply_text('🗑️ Стёрли. Начнём с чистого листа. В чём проблема?')
 
@@ -480,36 +569,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
 
+    logger.info(f'📩 Сообщение от {user_id}: {user_message[:50]}...')
+
     await update.message.chat.send_action('typing')
 
     try:
+        # Добавляем сообщение пользователя
         add_to_history(user_id, 'user', user_message)
+
+        # Получаем историю и отправляем запрос
         history = get_user_history(user_id)
         response = await send_to_chatgpt(history)
+
+        # Добавляем ответ ассистента
         add_to_history(user_id, 'assistant', response)
+
+        # Отправляем ответ
         await update.message.reply_text(response)
 
+        logger.info(f'✅ Ответ отправлен пользователю {user_id}')
+
     except Exception as e:
-        logger.error(f'Ошибка: {e}')
+        logger.error(f'❌ Ошибка при обработке сообщения: {e}', exc_info=True)
         await update.message.reply_text('❌ Что-то сломалось. Попробуй через минуту.')
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
-    logger.error(f'Update {update} caused error {context.error}')
+    logger.error(f'Update {update} caused error {context.error}', exc_info=context.error)
 
 
 def main():
     """Запуск бота"""
+    if not TELEGRAM_TOKEN:
+        logger.error('❌ TELEGRAM_TOKEN не найден в .env')
+        return
+
+    if not PROXYAPI_KEY:
+        logger.error('❌ PROXYAPI_KEY не найден в .env')
+        return
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем обработчики
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(CommandHandler('clear', clear_history))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 
     logger.info('⚡ Тайлер онлайн. Готов раздавать пиздюлей.')
+    logger.info(f'📊 Настройки контекста:')
+    logger.info(f'   - Макс. пар сообщений: {MAX_HISTORY_PAIRS}')
+    logger.info(f'   - Лимит токенов: {CONTEXT_TOKEN_LIMIT}')
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
