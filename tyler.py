@@ -79,7 +79,7 @@ async def send_to_chatgpt(messages: list) -> str:
     }
 
     data = {
-        'model': 'gpt-4o-mini',
+        'model': 'gpt-5.1',
         'messages': messages,
         'temperature': 1.0,  # Максимум для живости и разнообразия
         'max_completion_tokens': 800  # Ограничение для коротких ответов
