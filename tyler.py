@@ -124,10 +124,10 @@ async def send_to_chatgpt(messages: list) -> str:
     }
 
     data = {
-        'model': 'gpt-5.1-codex-mini',
+        'model': 'gpt-4o-mini',  # Работает с chat/completions
         'messages': messages,
         'temperature': 1.0,  # Максимум для живости и разнообразия
-        'max_completion_tokens': 800  # Ограничение для коротких ответов
+        'max_tokens': 800  # Ограничение для коротких ответов
     }
 
     try:
