@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY')
 PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat/completions')
+CONTEXT_TOKEN_LIMIT = int(os.getenv('CONTEXT_TOKEN_LIMIT', '4000'))  # Лимит токенов для контекста
 
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
@@ -37,8 +38,41 @@ user_chats = defaultdict(list)
 MAX_HISTORY = 10
 
 
+def estimate_tokens(text: str) -> int:
+    """Примерный подсчёт токенов (1 токен ≈ 4 символа для русского)"""
+    return len(text) // 3
+
+
+def trim_context_by_tokens(messages: list, token_limit: int) -> list:
+    """Обрезаем контекст до лимита токенов, сохраняя системный промпт"""
+    if not messages:
+        return messages
+
+    # Системный промпт всегда сохраняем
+    system_prompt = messages[0]
+    user_messages = messages[1:]
+
+    total_tokens = estimate_tokens(system_prompt['content'])
+    trimmed_messages = [system_prompt]
+
+    # Добавляем сообщения с конца (самые свежие)
+    for msg in reversed(user_messages):
+        msg_tokens = estimate_tokens(msg['content'])
+        if total_tokens + msg_tokens > token_limit:
+            break
+        trimmed_messages.insert(1, msg)  # Вставляем после системного промпта
+        total_tokens += msg_tokens
+
+    logger.info(f'📊 Контекст: {len(trimmed_messages) - 1} сообщений, ~{total_tokens} токенов')
+    return trimmed_messages
+
+
 async def send_to_chatgpt(messages: list) -> str:
     """Отправка запроса к ChatGPT через ProxyAPI"""
+
+    # Обрезаем контекст по лимиту токенов
+    messages = trim_context_by_tokens(messages, CONTEXT_TOKEN_LIMIT)
+
     headers = {
         'Authorization': f'Bearer {PROXYAPI_KEY}',
         'Content-Type': 'application/json'
