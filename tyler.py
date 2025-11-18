@@ -14,6 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import aiohttp
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -33,9 +34,12 @@ CONTEXT_TOKEN_LIMIT = int(os.getenv('CONTEXT_TOKEN_LIMIT', '4000'))  # Лими�
 
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
+user_last_activity = defaultdict(datetime.now)  # Время последней активности
 
-# Максимальное количество сообщений в истории
-MAX_HISTORY = 10
+# Настройки автоматической очистки
+MAX_HISTORY = 10  # Максимальное количество сообщений в истории
+INACTIVITY_HOURS = 24  # Часов неактивности до очистки контекста
+AUTO_CLEANUP_INTERVAL = 3600  # Проверка каждый час (в секундах)
 
 
 def estimate_tokens(text: str) -> int:
@@ -65,6 +69,32 @@ def trim_context_by_tokens(messages: list, token_limit: int) -> list:
 
     logger.info(f'📊 Контекст: {len(trimmed_messages) - 1} сообщений, ~{total_tokens} токенов')
     return trimmed_messages
+
+
+def cleanup_inactive_users():
+    """Автоматическая очистка контекста неактивных пользователей"""
+    current_time = datetime.now()
+    inactive_threshold = timedelta(hours=INACTIVITY_HOURS)
+
+    users_to_clean = []
+
+    for user_id, last_activity in user_last_activity.items():
+        if current_time - last_activity > inactive_threshold:
+            users_to_clean.append(user_id)
+
+    for user_id in users_to_clean:
+        if user_id in user_chats:
+            del user_chats[user_id]
+        del user_last_activity[user_id]
+        logger.info(f'🧹 Очистка контекста для неактивного пользователя {user_id}')
+
+    if users_to_clean:
+        logger.info(f'🧹 Очищено контекстов: {len(users_to_clean)}')
+
+
+async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая очистка контекста"""
+    cleanup_inactive_users()
 
 
 async def send_to_chatgpt(messages: list) -> str:
@@ -234,10 +264,6 @@ def get_user_history(user_id: int) -> list:
 
 ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ:
 
-ПРИМЕРЫ:
-
-ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ:
-
 === ПРИМЕР 1: ПРОСТО НАЕЗД ===
 Вопрос: "Хочу накачаться"
 Ответ: "Хотят все. Пиздец какое открытие.
@@ -404,17 +430,24 @@ def get_user_history(user_id: int) -> list:
 
 
 def add_to_history(user_id: int, role: str, content: str):
-    """Добавление сообщения в историю"""
+    """Добавление сообщения в историю с автоматической очисткой"""
     history = get_user_history(user_id)
     history.append({'role': role, 'content': content})
 
-    # Ограничиваем размер истории
+    # Обновляем время последней активности
+    user_last_activity[user_id] = datetime.now()
+
+    # Ограничиваем размер истории (оставляем только системный промпт + последние MAX_HISTORY сообщений)
     if len(history) > MAX_HISTORY + 1:
         user_chats[user_id] = [history[0]] + history[-(MAX_HISTORY):]
+        logger.info(f'🧹 Контекст обрезан для пользователя {user_id}: оставлено {MAX_HISTORY} последних сообщений')
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    user_last_activity[user_id] = datetime.now()
+
     welcome_message = """
 ⚡ Слушай, бездарь.
 
@@ -435,6 +468,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
+    user_id = update.effective_user.id
+    user_last_activity[user_id] = datetime.now()
+
     help_message = """
 💪 ЧТО Я ДЕЛАЮ:
 
@@ -460,6 +496,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /clear - Новый разговор
 /start - В начало
 
+ℹ️ Контекст автоматически очищается после 24ч неактивности
+
 Всё. Хватит читать. Действуй.
     """
     await update.message.reply_text(help_message.strip())
@@ -471,6 +509,8 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id in user_chats:
         del user_chats[user_id]
+
+    user_last_activity[user_id] = datetime.now()
 
     await update.message.reply_text('🗑️ Стёрли. Начнём с чистого листа. В чём проблема?')
 
@@ -503,6 +543,10 @@ def main():
     """Запуск бота"""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем периодическую очистку контекста
+    job_queue = application.job_queue
+    job_queue.run_repeating(periodic_cleanup, interval=AUTO_CLEANUP_INTERVAL, first=AUTO_CLEANUP_INTERVAL)
+
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('clear', clear_history))
@@ -510,6 +554,7 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info('⚡ Тайлер онлайн. Готов раздавать пиздюлей.')
+    logger.info(f'🧹 Автоочистка: каждые {AUTO_CLEANUP_INTERVAL // 3600}ч, неактивность {INACTIVITY_HOURS}ч')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
