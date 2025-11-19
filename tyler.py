@@ -9,6 +9,7 @@ Tyler Durden Telegram Bot
 
 import os
 import json
+import time
 import logging
 from dotenv import load_dotenv
 from telegram import Update
@@ -40,6 +41,27 @@ USERS_DB_FILE = 'users_db.json'
 
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
+
+# Защита от спама
+SPAM_LIMIT = int(os.getenv('SPAM_LIMIT', '5'))  # Макс сообщений в минуту
+SPAM_WINDOW = 60  # Окно в секундах
+user_message_times = defaultdict(list)  # Время сообщений пользователей
+
+
+def is_spam(user_id: int) -> bool:
+    """Проверка на спам"""
+    current_time = time.time()
+    # Удаляем старые записи
+    user_message_times[user_id] = [
+        t for t in user_message_times[user_id]
+        if current_time - t < SPAM_WINDOW
+    ]
+    # Проверяем лимит
+    if len(user_message_times[user_id]) >= SPAM_LIMIT:
+        return True
+    # Добавляем текущее время
+    user_message_times[user_id].append(current_time)
+    return False
 
 
 def load_users_from_db() -> set:
@@ -363,6 +385,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     user_message = update.message.text
+
+    # Проверка на спам
+    if is_spam(user_id):
+        await update.message.reply_text('🚫 Слишком много сообщений. Подожди минуту, торопыга.')
+        return
 
     # Добавляем пользователя в множество уникальных и сохраняем в БД
     if user_id not in unique_users:
