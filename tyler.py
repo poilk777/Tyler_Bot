@@ -29,15 +29,13 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY')
 PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat/completions')
+MAX_HISTORY = int(os.getenv('MAX_HISTORY', '10'))
 
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
 # Множество для отслеживания уникальных пользователей
 unique_users = set()
-
-# Максимальное количество сообщений в истории
-MAX_HISTORY = 10
 
 
 def get_unique_users_count() -> int:
@@ -288,7 +286,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Хочешь перемен? Задавай вопросы.
 Готов ныть? Иди нахуй.
 
-/clear - Стереть историю
 /help - Что я умею
 
 Ну чё, в чём проблема?
@@ -320,22 +317,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 Мозги (книги, навыки)
 🗣️ Общение (девушки, друзья)
 
-/clear - Новый разговор
 /start - В начало
 
 Всё. Хватит читать. Действуй.
     """
     await update.message.reply_text(help_message.strip())
-
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /clear"""
-    user_id = update.effective_user.id
-
-    if user_id in user_chats:
-        del user_chats[user_id]
-
-    await update.message.reply_text('🗑️ Стёрли. Начнём с чистого листа. В чём проблема?')
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,6 +337,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Добавляем пользователя в множество уникальных
     unique_users.add(user_id)
+    logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
 
     await update.message.chat.send_action('typing')
 
@@ -377,7 +364,6 @@ def main():
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('clear', clear_history))
     application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
