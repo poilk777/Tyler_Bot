@@ -8,6 +8,7 @@ Tyler Durden Telegram Bot
 """
 
 import os
+import json
 import logging
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,16 +26,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Отключаем спам от httpx
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY')
 PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat/completions')
+MAX_HISTORY = int(os.getenv('MAX_HISTORY', '10'))
+
+# Путь к файлу базы данных пользователей
+USERS_DB_FILE = 'users_db.json'
 
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
-# Максимальное количество сообщений в истории
-MAX_HISTORY = 10
+
+def load_users_from_db() -> set:
+    """Загрузка пользователей из базы данных"""
+    if os.path.exists(USERS_DB_FILE):
+        try:
+            with open(USERS_DB_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get('user_ids', []))
+        except Exception as e:
+            logger.error(f'Ошибка загрузки базы пользователей: {e}')
+    return set()
+
+
+def save_users_to_db(users: set):
+    """Сохранение пользователей в базу данных"""
+    try:
+        with open(USERS_DB_FILE, 'w') as f:
+            json.dump({'user_ids': list(users)}, f)
+    except Exception as e:
+        logger.error(f'Ошибка сохранения базы пользователей: {e}')
+
+
+# Множество для отслеживания уникальных пользователей (загружаем из БД)
+unique_users = load_users_from_db()
+
+
+def get_unique_users_count() -> int:
+    """Получение количества уникальных пользователей"""
+    return len(unique_users)
 
 
 async def send_to_chatgpt(messages: list) -> str:
@@ -56,30 +91,6 @@ async def send_to_chatgpt(messages: list) -> str:
             async with session.post(PROXYAPI_URL, json=data, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
-
-                    # Подсчёт стоимости
-                    usage = result.get('usage', {})
-                    prompt_tokens = usage.get('prompt_tokens', 0)
-                    completion_tokens = usage.get('completion_tokens', 0)
-                    total_tokens = usage.get('total_tokens', 0)
-
-                    # Цены для gpt-4o-mini (примерные, проверь актуальные на proxyapi.ru)
-                    # Обычно: $0.150 / 1M input tokens, $0.600 / 1M output tokens
-                    input_price_per_1m = 0.150  # USD
-                    output_price_per_1m = 0.600  # USD
-                    usd_to_rub = 100  # Курс доллара к рублю (обнови актуальный)
-
-                    input_cost_usd = (prompt_tokens / 1_000_000) * input_price_per_1m
-                    output_cost_usd = (completion_tokens / 1_000_000) * output_price_per_1m
-                    total_cost_usd = input_cost_usd + output_cost_usd
-                    total_cost_rub = total_cost_usd * usd_to_rub
-
-                    logger.info(f'💰 Запрос выполнен:')
-                    logger.info(f'   Input токены: {prompt_tokens}')
-                    logger.info(f'   Output токены: {completion_tokens}')
-                    logger.info(f'   Всего токенов: {total_tokens}')
-                    logger.info(f'   Стоимость: ${total_cost_usd:.6f} (~{total_cost_rub:.4f} ₽)')
-
                     return result['choices'][0]['message']['content']
                 else:
                     error_text = await response.text()
@@ -304,7 +315,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Хочешь перемен? Задавай вопросы.
 Готов ныть? Иди нахуй.
 
-/clear - Стереть историю
 /help - Что я умею
 
 Ну чё, в чём проблема?
@@ -336,7 +346,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 Мозги (книги, навыки)
 🗣️ Общение (девушки, друзья)
 
-/clear - Новый разговор
 /start - В начало
 
 Всё. Хватит читать. Действуй.
@@ -344,20 +353,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_message.strip())
 
 
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /clear"""
-    user_id = update.effective_user.id
-
-    if user_id in user_chats:
-        del user_chats[user_id]
-
-    await update.message.reply_text('🗑️ Стёрли. Начнём с чистого листа. В чём проблема?')
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stats"""
+    users_count = get_unique_users_count()
+    await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     user_message = update.message.text
+
+    # Добавляем пользователя в множество уникальных и сохраняем в БД
+    if user_id not in unique_users:
+        unique_users.add(user_id)
+        save_users_to_db(unique_users)
+    logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
 
     await update.message.chat.send_action('typing')
 
@@ -384,7 +395,7 @@ def main():
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('clear', clear_history))
+    application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 
