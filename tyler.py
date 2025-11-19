@@ -33,8 +33,16 @@ PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
+# Множество для отслеживания уникальных пользователей
+unique_users = set()
+
 # Максимальное количество сообщений в истории
 MAX_HISTORY = 10
+
+
+def get_unique_users_count() -> int:
+    """Получение количества уникальных пользователей"""
+    return len(unique_users)
 
 
 async def send_to_chatgpt(messages: list) -> str:
@@ -56,30 +64,6 @@ async def send_to_chatgpt(messages: list) -> str:
             async with session.post(PROXYAPI_URL, json=data, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
-
-                    # Подсчёт стоимости
-                    usage = result.get('usage', {})
-                    prompt_tokens = usage.get('prompt_tokens', 0)
-                    completion_tokens = usage.get('completion_tokens', 0)
-                    total_tokens = usage.get('total_tokens', 0)
-
-                    # Цены для gpt-4o-mini (примерные, проверь актуальные на proxyapi.ru)
-                    # Обычно: $0.150 / 1M input tokens, $0.600 / 1M output tokens
-                    input_price_per_1m = 0.150  # USD
-                    output_price_per_1m = 0.600  # USD
-                    usd_to_rub = 100  # Курс доллара к рублю (обнови актуальный)
-
-                    input_cost_usd = (prompt_tokens / 1_000_000) * input_price_per_1m
-                    output_cost_usd = (completion_tokens / 1_000_000) * output_price_per_1m
-                    total_cost_usd = input_cost_usd + output_cost_usd
-                    total_cost_rub = total_cost_usd * usd_to_rub
-
-                    logger.info(f'💰 Запрос выполнен:')
-                    logger.info(f'   Input токены: {prompt_tokens}')
-                    logger.info(f'   Output токены: {completion_tokens}')
-                    logger.info(f'   Всего токенов: {total_tokens}')
-                    logger.info(f'   Стоимость: ${total_cost_usd:.6f} (~{total_cost_rub:.4f} ₽)')
-
                     return result['choices'][0]['message']['content']
                 else:
                     error_text = await response.text()
@@ -354,10 +338,19 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('🗑️ Стёрли. Начнём с чистого листа. В чём проблема?')
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stats"""
+    users_count = get_unique_users_count()
+    await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     user_message = update.message.text
+
+    # Добавляем пользователя в множество уникальных
+    unique_users.add(user_id)
 
     await update.message.chat.send_action('typing')
 
@@ -385,6 +378,7 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('clear', clear_history))
+    application.add_handler(CommandHandler('stats', stats_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 
