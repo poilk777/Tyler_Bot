@@ -8,6 +8,7 @@ Tyler Durden Telegram Bot
 """
 
 import os
+import json
 import logging
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,17 +26,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Отключаем спам от httpx
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY')
 PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat/completions')
 MAX_HISTORY = int(os.getenv('MAX_HISTORY', '10'))
 
+# Путь к файлу базы данных пользователей
+USERS_DB_FILE = 'users_db.json'
+
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
-# Множество для отслеживания уникальных пользователей
-unique_users = set()
+
+def load_users_from_db() -> set:
+    """Загрузка пользователей из базы данных"""
+    if os.path.exists(USERS_DB_FILE):
+        try:
+            with open(USERS_DB_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get('user_ids', []))
+        except Exception as e:
+            logger.error(f'Ошибка загрузки базы пользователей: {e}')
+    return set()
+
+
+def save_users_to_db(users: set):
+    """Сохранение пользователей в базу данных"""
+    try:
+        with open(USERS_DB_FILE, 'w') as f:
+            json.dump({'user_ids': list(users)}, f)
+    except Exception as e:
+        logger.error(f'Ошибка сохранения базы пользователей: {e}')
+
+
+# Множество для отслеживания уникальных пользователей (загружаем из БД)
+unique_users = load_users_from_db()
 
 
 def get_unique_users_count() -> int:
@@ -335,8 +364,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
 
-    # Добавляем пользователя в множество уникальных
-    unique_users.add(user_id)
+    # Добавляем пользователя в множество уникальных и сохраняем в БД
+    if user_id not in unique_users:
+        unique_users.add(user_id)
+        save_users_to_db(unique_users)
     logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
 
     await update.message.chat.send_action('typing')
