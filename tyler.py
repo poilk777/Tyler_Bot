@@ -632,7 +632,13 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user_id = update.effective_user.id
     add_premium(user_id, months=1)
 
-    expiry = datetime.fromisoformat(db['premium_users'][str(user_id)])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+
+    expiry = datetime.fromisoformat(result[0])
     expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
 
     await update.message.reply_text(
