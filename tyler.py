@@ -11,11 +11,13 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters, ContextTypes
 import aiohttp
 from collections import defaultdict
+import pytz
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -42,10 +44,19 @@ USERS_DB_FILE = 'users_db.json'
 # Хранилище истории чатов для каждого пользователя
 user_chats = defaultdict(list)
 
+# Хранилище ожидающих сообщений (user_id -> message_text)
+pending_messages = {}
+
 # Защита от спама
 SPAM_LIMIT = int(os.getenv('SPAM_LIMIT', '5'))  # Макс сообщений в минуту
 SPAM_WINDOW = 60  # Окно в секундах
 user_message_times = defaultdict(list)  # Время сообщений пользователей
+
+# Константы для умного режима
+SMART_DAILY_LIMIT = 3  # Бесплатных запросов к умному режиму в день
+PREMIUM_PRICE_STARS = int(os.getenv('PREMIUM_PRICE_STARS', '500'))  # Цена подписки в звездах
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+PROVIDER_TOKEN = os.getenv('PROVIDER_TOKEN', '')  # Токен провайдера для платежей
 
 
 def is_spam(user_id: int) -> bool:
@@ -64,29 +75,29 @@ def is_spam(user_id: int) -> bool:
     return False
 
 
-def load_users_from_db() -> set:
-    """Загрузка пользователей из базы данных"""
+def load_db() -> dict:
+    """Загрузка базы данных"""
     if os.path.exists(USERS_DB_FILE):
         try:
             with open(USERS_DB_FILE, 'r') as f:
-                data = json.load(f)
-                return set(data.get('user_ids', []))
+                return json.load(f)
         except Exception as e:
-            logger.error(f'Ошибка загрузки базы пользователей: {e}')
-    return set()
+            logger.error(f'Ошибка загрузки БД: {e}')
+    return {'user_ids': [], 'smart_usage': {}, 'premium_users': {}}
 
 
-def save_users_to_db(users: set):
-    """Сохранение пользователей в базу данных"""
+def save_db(db: dict):
+    """Сохранение базы данных"""
     try:
         with open(USERS_DB_FILE, 'w') as f:
-            json.dump({'user_ids': list(users)}, f)
+            json.dump(db, f, indent=2)
     except Exception as e:
-        logger.error(f'Ошибка сохранения базы пользователей: {e}')
+        logger.error(f'Ошибка сохранения БД: {e}')
 
 
-# Множество для отслеживания уникальных пользователей (загружаем из БД)
-unique_users = load_users_from_db()
+# Загружаем БД
+db = load_db()
+unique_users = set(db.get('user_ids', []))
 
 
 def get_unique_users_count() -> int:
@@ -94,7 +105,82 @@ def get_unique_users_count() -> int:
     return len(unique_users)
 
 
-async def send_to_chatgpt(messages: list) -> str:
+def get_current_date_msk() -> str:
+    """Получение текущей даты по МСК в формате YYYY-MM-DD"""
+    return datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
+
+
+def is_premium(user_id: int) -> bool:
+    """Проверка премиум статуса пользователя"""
+    user_id_str = str(user_id)
+    if user_id_str in db.get('premium_users', {}):
+        expiry = datetime.fromisoformat(db['premium_users'][user_id_str])
+        return datetime.now(MOSCOW_TZ) < expiry
+    return False
+
+
+def add_premium(user_id: int, months: int = 1):
+    """Добавление премиум подписки пользователю"""
+    user_id_str = str(user_id)
+    if 'premium_users' not in db:
+        db['premium_users'] = {}
+
+    current_expiry = None
+    if user_id_str in db['premium_users']:
+        current_expiry = datetime.fromisoformat(db['premium_users'][user_id_str])
+
+    if current_expiry and current_expiry > datetime.now(MOSCOW_TZ):
+        new_expiry = current_expiry + timedelta(days=30 * months)
+    else:
+        new_expiry = datetime.now(MOSCOW_TZ) + timedelta(days=30 * months)
+
+    db['premium_users'][user_id_str] = new_expiry.isoformat()
+    save_db(db)
+
+
+def get_smart_usage_today(user_id: int) -> int:
+    """Получение количества использований умного режима сегодня"""
+    user_id_str = str(user_id)
+    today = get_current_date_msk()
+
+    if 'smart_usage' not in db:
+        db['smart_usage'] = {}
+
+    if user_id_str not in db['smart_usage']:
+        return 0
+
+    return db['smart_usage'][user_id_str].get(today, 0)
+
+
+def increment_smart_usage(user_id: int):
+    """Увеличение счетчика использования умного режима"""
+    user_id_str = str(user_id)
+    today = get_current_date_msk()
+
+    if 'smart_usage' not in db:
+        db['smart_usage'] = {}
+
+    if user_id_str not in db['smart_usage']:
+        db['smart_usage'][user_id_str] = {}
+
+    db['smart_usage'][user_id_str][today] = db['smart_usage'][user_id_str].get(today, 0) + 1
+    save_db(db)
+
+
+def can_use_smart(user_id: int) -> tuple[bool, str]:
+    """Проверка возможности использования умного режима. Возвращает (можно, сообщение)"""
+    if is_premium(user_id):
+        return True, "Безлимитный доступ (Premium)"
+
+    usage = get_smart_usage_today(user_id)
+    if usage < SMART_DAILY_LIMIT:
+        remaining = SMART_DAILY_LIMIT - usage
+        return True, f"Осталось запросов сегодня: {remaining}"
+
+    return False, "Лимит исчерпан. Купи Premium или используй глупый режим."
+
+
+async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
     """Отправка запроса к ChatGPT через ProxyAPI"""
     headers = {
         'Authorization': f'Bearer {PROXYAPI_KEY}',
@@ -102,7 +188,7 @@ async def send_to_chatgpt(messages: list) -> str:
     }
 
     data = {
-        'model': 'gpt-5.1',
+        'model': model,
         'messages': messages,
         'temperature': 0.9,
         'max_completion_tokens': 800  # Ограничение для коротких ответов
@@ -334,6 +420,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Я здесь чтобы дать тебе пинка под зад и КОНКРЕТНЫЙ план действий.
 
+У меня два режима:
+🧠 Умный Тайлер - мощный, но лимит 3 запроса в день
+💬 Глупый Тайлер - проще, но безлимитно
+
+💎 /premium - Безлимитный умный режим
+
 Хочешь перемен? Задавай вопросы.
 Готов ныть? Иди нахуй.
 
@@ -357,9 +449,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ❌ НЕ ЖДИ:
 - Жалости
-- Утешений  
+- Утешений
 - Общих советов
 - Мягкости
+
+РЕЖИМЫ:
+🧠 Умный Тайлер (gpt-5.1) - 3 запроса в день
+💬 Глупый Тайлер (gpt-4) - безлимитно
+💎 Premium - безлимитный умный режим
 
 ТЕМЫ:
 🏋️ Тело (тренировки, питание)
@@ -368,7 +465,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 Мозги (книги, навыки)
 🗣️ Общение (девушки, друзья)
 
+КОМАНДЫ:
 /start - В начало
+/premium - Купить безлимит
+/stats - Статистика
 
 Всё. Хватит читать. Действуй.
     """
@@ -379,6 +479,79 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stats"""
     users_count = get_unique_users_count()
     await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
+
+
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /premium"""
+    user_id = update.effective_user.id
+
+    if is_premium(user_id):
+        expiry = datetime.fromisoformat(db['premium_users'][str(user_id)])
+        expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
+        usage = get_smart_usage_today(user_id)
+        await update.message.reply_text(
+            f"💎 **Premium активен**\n\n"
+            f"✅ Безлимитный умный режим\n"
+            f"📅 Действует до: {expiry_str}\n"
+            f"📊 Использовано сегодня: {usage}",
+            parse_mode='Markdown'
+        )
+    else:
+        usage = get_smart_usage_today(user_id)
+        remaining = max(0, SMART_DAILY_LIMIT - usage)
+
+        keyboard = [[InlineKeyboardButton("💎 Купить Premium", callback_data="buy_premium")]]
+
+        await update.message.reply_text(
+            f"💎 **Tyler Premium**\n\n"
+            f"🧠 Безлимитный доступ к умному режиму\n"
+            f"⏰ На 30 дней\n"
+            f"💫 Цена: {PREMIUM_PRICE_STARS} звезд\n\n"
+            f"📊 Сейчас доступно: {remaining}/{SMART_DAILY_LIMIT} запросов",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+
+async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик покупки Premium"""
+    query = update.callback_query
+    await query.answer()
+
+    prices = [LabeledPrice("Tyler Premium (30 дней)", PREMIUM_PRICE_STARS)]
+
+    await context.bot.send_invoice(
+        chat_id=query.message.chat_id,
+        title="Tyler Premium",
+        description="Безлимитный доступ к умному режиму на 30 дней",
+        payload="premium_subscription",
+        provider_token="",  # Пустой токен для Telegram Stars
+        currency="XTR",  # Telegram Stars
+        prices=prices
+    )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик пре-проверки платежа"""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик успешной оплаты"""
+    user_id = update.effective_user.id
+    add_premium(user_id, months=1)
+
+    expiry = datetime.fromisoformat(db['premium_users'][str(user_id)])
+    expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
+
+    await update.message.reply_text(
+        f"🎉 **Premium активирован!**\n\n"
+        f"✅ Безлимитный умный режим\n"
+        f"📅 Действует до: {expiry_str}\n\n"
+        f"Давай, действуй!",
+        parse_mode='Markdown'
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,21 +567,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Добавляем пользователя в множество уникальных и сохраняем в БД
     if user_id not in unique_users:
         unique_users.add(user_id)
-        save_users_to_db(unique_users)
+        db['user_ids'].append(user_id)
+        save_db(db)
     logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
 
-    await update.message.chat.send_action('typing')
+    # Сохраняем сообщение и показываем кнопки выбора режима
+    pending_messages[user_id] = user_message
+
+    can_smart, smart_status = can_use_smart(user_id)
+
+    keyboard = [
+        [InlineKeyboardButton("🧠 Умный Тайлер", callback_data="mode_smart")],
+        [InlineKeyboardButton("💬 Глупый Тайлер", callback_data="mode_dumb")]
+    ]
+
+    status_text = f"✅ {smart_status}" if can_smart else f"⛔ {smart_status}"
+
+    await update.message.reply_text(
+        f"Выбери режим:\n\n"
+        f"🧠 **Умный Тайлер** (gpt-5.1)\n"
+        f"{status_text}\n\n"
+        f"💬 **Глупый Тайлер** (gpt-4)\n"
+        f"✅ Безлимитно\n\n"
+        f"💎 /premium - Безлимитный умный режим",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    # Обработка покупки Premium
+    if query.data == "buy_premium":
+        await buy_premium_callback(update, context)
+        return
+
+    # Обработка выбора режима
+    if user_id not in pending_messages:
+        await query.edit_message_text("⚠️ Сообщение устарело. Отправь новое.")
+        return
+
+    user_message = pending_messages[user_id]
+    del pending_messages[user_id]
+
+    if query.data == "mode_smart":
+        can_smart, msg = can_use_smart(user_id)
+        if not can_smart:
+            await query.edit_message_text(f"⛔ {msg}\n\n💎 /premium - Безлимитный доступ")
+            return
+
+        await query.edit_message_text("🧠 Умный Тайлер думает...")
+        model = 'gpt-5.1'
+        increment_smart_usage(user_id)
+
+    elif query.data == "mode_dumb":
+        await query.edit_message_text("💬 Глупый Тайлер отвечает...")
+        model = 'gpt-4'
+    else:
+        return
 
     try:
         add_to_history(user_id, 'user', user_message)
         history = get_user_history(user_id)
-        response = await send_to_chatgpt(history)
+        response = await send_to_chatgpt(history, model=model)
         add_to_history(user_id, 'assistant', response)
-        await update.message.reply_text(response)
+        await query.message.reply_text(response)
 
     except Exception as e:
         logger.error(f'Ошибка: {e}')
-        await update.message.reply_text('❌ Что-то сломалось. Попробуй через минуту.')
+        await query.message.reply_text('❌ Что-то сломалось. Попробуй через минуту.')
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,10 +652,23 @@ def main():
     """Запуск бота"""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Команды
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('stats', stats_command))
+    application.add_handler(CommandHandler('premium', premium_command))
+
+    # Callback кнопки
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Платежи
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
+    # Текстовые сообщения
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Ошибки
     application.add_error_handler(error_handler)
 
     logger.info('⚡ Тайлер онлайн. Готов раздавать пиздюлей.')
