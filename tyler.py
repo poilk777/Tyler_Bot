@@ -56,6 +56,7 @@ bot_message_times = []
 SMART_DAILY_LIMIT = 3  # Бесплатных запросов к умному режиму в день
 PREMIUM_PRICE_STARS = int(os.getenv('PREMIUM_PRICE_STARS', '500'))  # Цена подписки в звездах
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0')) if os.getenv('ADMIN_USER_ID') else None
 
 
 def init_db():
@@ -165,6 +166,10 @@ def set_user_mode(user_id: int, mode: str):
 
 def is_premium(user_id: int) -> bool:
     """Проверка премиум статуса пользователя"""
+    # Админ всегда имеет премиум доступ
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
@@ -228,9 +233,15 @@ def increment_smart_usage(user_id: int):
 
 def can_use_smart(user_id: int) -> tuple[bool, str]:
     """Проверка возможности использования умного режима. Возвращает (можно, сообщение)"""
+    # Админ
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True, "Безлимитный доступ (Admin)"
+
+    # Премиум
     if is_premium(user_id):
         return True, "Безлимитный доступ (Premium)"
 
+    # Обычный пользователь
     usage = get_smart_usage_today(user_id)
     if usage < SMART_DAILY_LIMIT:
         remaining = SMART_DAILY_LIMIT - usage
@@ -564,6 +575,18 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ensure_user_exists(user_id)
 
+    # Проверка на админа
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        usage = get_smart_usage_today(user_id)
+        await update.message.reply_text(
+            f"👑 **Admin доступ**\n\n"
+            f"✅ Безлимитный умный режим\n"
+            f"📅 Бессрочно\n"
+            f"📊 Использовано сегодня: {usage}",
+            parse_mode='Markdown'
+        )
+        return
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
@@ -692,7 +715,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status_msg = ""
         if new_mode == 'smart':
-            if is_premium(user_id):
+            if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+                status_msg = "\n👑 Безлимитный доступ (Admin)"
+            elif is_premium(user_id):
                 status_msg = "\n✅ Безлимитный доступ (Premium)"
             else:
                 usage = get_smart_usage_today(user_id)
