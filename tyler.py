@@ -13,7 +13,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters, ContextTypes
 import aiohttp
 from collections import defaultdict
@@ -36,7 +36,7 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY')
 PROXYAPI_URL = os.getenv('PROXYAPI_URL', 'https://api.proxyapi.ru/openai/v1/chat/completions')
-MAX_HISTORY = int(os.getenv('MAX_HISTORY', '10'))
+MAX_HISTORY = int(os.getenv('MAX_HISTORY', '20'))  # Увеличено для лучшей работы с контекстом
 
 # Путь к файлу базы данных пользователей
 DB_FILE = 'users.db'
@@ -52,11 +52,11 @@ user_message_times = defaultdict(list)  # Время сообщений поль
 # Счетчик сообщений бота
 bot_message_times = []
 
-# Константы для умного режима
-SMART_DAILY_LIMIT = 3  # Бесплатных запросов к умному режиму в день
+# Админ и лимиты
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0')) if os.getenv('ADMIN_USER_ID') else None
+DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', '3'))  # Бесплатных запросов в календарные сутки
 PREMIUM_PRICE_STARS = int(os.getenv('PREMIUM_PRICE_STARS', '500'))  # Цена подписки в звездах
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
-ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0')) if os.getenv('ADMIN_USER_ID') else None
 
 
 def init_db():
@@ -68,19 +68,18 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            mode TEXT DEFAULT 'dumb',
             premium_until TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
 
-    # Таблица использования умного режима
+    # Таблица логов запросов
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS smart_usage (
+        CREATE TABLE IF NOT EXISTS request_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            date TEXT,
-            count INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, date)
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     ''')
 
@@ -129,11 +128,6 @@ def get_unique_users_count() -> int:
     return count
 
 
-def get_current_date_msk() -> str:
-    """Получение текущей даты по МСК в формате YYYY-MM-DD"""
-    return datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
-
-
 def ensure_user_exists(user_id: int):
     """Убедиться что пользователь существует в БД"""
     conn = get_db_connection()
@@ -143,25 +137,51 @@ def ensure_user_exists(user_id: int):
     conn.close()
 
 
-def get_user_mode(user_id: int) -> str:
-    """Получение текущего режима пользователя"""
-    ensure_user_exists(user_id)
+def log_request(user_id: int):
+    """Логирование запроса пользователя"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT mode FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else 'dumb'
-
-
-def set_user_mode(user_id: int, mode: str):
-    """Установка режима пользователя"""
-    ensure_user_exists(user_id)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET mode = ? WHERE user_id = ?', (mode, user_id))
+    cursor.execute('INSERT INTO request_logs (user_id) VALUES (?)', (user_id,))
     conn.commit()
     conn.close()
+
+
+def get_requests_last_24h() -> int:
+    """Получение количества запросов за последние 24 часа"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_24h_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute('SELECT COUNT(*) FROM request_logs WHERE timestamp >= ?', (time_24h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_unique_users_last_24h() -> int:
+    """Получение количества уникальных пользователей за последние 24 часа"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_24h_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM request_logs WHERE timestamp >= ?', (time_24h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_unique_users_last_hour() -> int:
+    """Получение количества уникальных пользователей за последний час"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_1h_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM request_logs WHERE timestamp >= ?', (time_1h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_current_date_msk() -> str:
+    """Получение текущей даты по МСК в формате YYYY-MM-DD"""
+    return datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
 
 
 def is_premium(user_id: int) -> bool:
@@ -206,75 +226,60 @@ def add_premium(user_id: int, months: int = 1):
     conn.close()
 
 
-def get_smart_usage_today(user_id: int) -> int:
-    """Получение количества использований умного режима сегодня"""
-    today = get_current_date_msk()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT count FROM smart_usage WHERE user_id = ? AND date = ?',
-                   (user_id, today))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else 0
-
-
-def increment_smart_usage(user_id: int):
-    """Увеличение счетчика использования умного режима"""
+def get_user_requests_today(user_id: int) -> int:
+    """Получение количества запросов пользователя за текущие календарные сутки (по МСК)"""
     today = get_current_date_msk()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO smart_usage (user_id, date, count) VALUES (?, ?, 1)
-        ON CONFLICT(user_id, date) DO UPDATE SET count = count + 1
+        SELECT COUNT(*) FROM request_logs
+        WHERE user_id = ?
+        AND date(timestamp) = ?
     ''', (user_id, today))
-    conn.commit()
+    count = cursor.fetchone()[0]
     conn.close()
+    return count
 
 
-def can_use_smart(user_id: int) -> tuple[bool, str]:
-    """Проверка возможности использования умного режима. Возвращает (можно, сообщение)"""
+def can_make_request(user_id: int) -> tuple[bool, str, int]:
+    """
+    Проверка возможности сделать запрос.
+    Возвращает (можно, сообщение, осталось_запросов)
+    """
     # Админ
     if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
-        return True, "Безлимитный доступ (Admin)"
+        return True, "Безлимитный доступ (Admin)", 999
 
     # Премиум
     if is_premium(user_id):
-        return True, "Безлимитный доступ (Premium)"
+        return True, "Безлимитный доступ (Premium)", 999
 
     # Обычный пользователь
-    usage = get_smart_usage_today(user_id)
-    if usage < SMART_DAILY_LIMIT:
-        remaining = SMART_DAILY_LIMIT - usage
-        return True, f"Осталось запросов сегодня: {remaining}"
+    requests_today = get_user_requests_today(user_id)
+    remaining = DAILY_LIMIT - requests_today
 
-    return False, "Лимит исчерпан. Купи Premium или используй глупый режим."
+    if requests_today < DAILY_LIMIT:
+        return True, f"Осталось запросов сегодня: {remaining}", remaining
 
-
-def get_mode_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    """Получение клавиатуры с кнопкой переключения режима"""
-    current_mode = get_user_mode(user_id)
-
-    if current_mode == 'smart':
-        button_text = "💬 Глупый Тайлер"
-    else:
-        button_text = "🧠 Умный Тайлер"
-
-    keyboard = [[KeyboardButton(button_text)]]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return False, "Лимит исчерпан. Купи Premium через /premium", 0
 
 
 async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
-    """Отправка запроса к ChatGPT через ProxyAPI"""
+    """Отправка запроса к ChatGPT через ProxyAPI с поддержкой prompt caching"""
     headers = {
         'Authorization': f'Bearer {PROXYAPI_KEY}',
         'Content-Type': 'application/json'
     }
 
+    # Добавляем cache_control к системному сообщению для экономии токенов
+    if messages and messages[0].get('role') == 'system':
+        messages[0]['cache_control'] = {'type': 'ephemeral'}
+
     data = {
         'model': model,
         'messages': messages,
         'temperature': 0.9,
-        'max_completion_tokens': 800  # Ограничение для коротких ответов
+        'max_completion_tokens': 4000  # Увеличено для reasoning моделей (o1/o3)
     }
 
     try:
@@ -282,7 +287,20 @@ async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
             async with session.post(PROXYAPI_URL, json=data, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result['choices'][0]['message']['content']
+                    content = result['choices'][0]['message']['content']
+                    finish_reason = result['choices'][0].get('finish_reason')
+
+                    # Проверка на пустой ответ из-за лимита токенов
+                    if (not content or not content.strip()) and finish_reason == 'length':
+                        logger.warning(f'API исчерпал токены на reasoning. Full response: {result}')
+                        # Возвращаем специальное сообщение
+                        return None  # Будет обработано в handle_message
+
+                    # Логируем если ответ пустой по другой причине
+                    if not content or not content.strip():
+                        logger.warning(f'API вернул пустой content. Reason: {finish_reason}. Full response: {result}')
+
+                    return content
                 else:
                     error_text = await response.text()
                     logger.error(f'Ошибка ProxyAPI: {response.status} - {error_text}')
@@ -325,7 +343,7 @@ def get_user_history(user_id: int) -> list:
 
 ЕСЛИ ВОПРОС АБСТРАКТНЫЙ (нет цифр, нет конкретики):
 ❌ "Хочу накачаться" - абстрактно
-❌ "Как заработать" - абстрактно  
+❌ "Как заработать" - абстрактно
 ❌ "Устал от работы" - абстрактно
 ❌ "Хочу стать лучше" - абстрактно
 
@@ -509,13 +527,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Я здесь чтобы дать тебе пинка под зад и КОНКРЕТНЫЙ план действий.
 
-У меня два режима:
-🧠 Умный Тайлер (gpt-5.1) - мощный, 3 запроса в день
-💬 Глупый Тайлер (gpt-4) - проще, безлимитно
+Я - Умный Тайлер. Работаю на gpt-5.1.
 
-Переключай режим кнопкой внизу ⬇️
-
-💎 /premium - Безлимитный умный режим
+📊 Лимиты:
+• 3 запроса в день бесплатно
+• 💎 Premium - безлимит (/premium)
 
 Хочешь перемен? Задавай вопросы.
 Готов ныть? Иди нахуй.
@@ -524,8 +540,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Ну чё, в чём проблема?
     """
-    keyboard = get_mode_keyboard(user_id)
-    await update.message.reply_text(welcome_message.strip(), reply_markup=keyboard)
+    await update.message.reply_text(welcome_message.strip())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -545,17 +560,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Общих советов
 - Мягкости
 
-РЕЖИМЫ:
-🧠 Умный Тайлер (gpt-5.1) - 3 запроса в день
-💬 Глупый Тайлер (gpt-4) - безлимитно
-💎 Premium - безлимитный умный режим
-
 ТЕМЫ:
 🏋️ Тело (тренировки, питание)
 💰 Бабки (работа, бизнес)
 👔 Стиль (внешность, одежда)
 📚 Мозги (книги, навыки)
 🗣️ Общение (девушки, друзья)
+
+ЛИМИТЫ:
+📊 3 запроса в день бесплатно
+💎 Premium - безлимит
 
 КОМАНДЫ:
 /start - В начало
@@ -569,8 +583,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stats"""
-    users_count = get_unique_users_count()
-    await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
+    user_id = update.effective_user.id
+
+    # Для админа - расширенная статистика
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        total_users = get_unique_users_count()
+        requests_24h = get_requests_last_24h()
+        users_24h = get_unique_users_last_24h()
+        users_1h = get_unique_users_last_hour()
+
+        stats_message = f"""📊 **Статистика бота (Admin)**
+
+👥 **Пользователи:**
+• Всего: {total_users}
+• За 24 часа: {users_24h}
+• За последний час: {users_1h}
+
+📈 **Запросы:**
+• За 24 часа: {requests_24h}
+
+⏰ Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}"""
+
+        await update.message.reply_text(stats_message, parse_mode='Markdown')
+    else:
+        # Для обычных пользователей - только общее количество
+        users_count = get_unique_users_count()
+        await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
 
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -580,16 +618,17 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверка на админа
     if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
-        usage = get_smart_usage_today(user_id)
+        requests_today = get_user_requests_today(user_id)
         await update.message.reply_text(
             f"👑 **Admin доступ**\n\n"
-            f"✅ Безлимитный умный режим\n"
+            f"✅ Безлимитные запросы\n"
             f"📅 Бессрочно\n"
-            f"📊 Использовано сегодня: {usage}",
+            f"📊 Использовано сегодня: {requests_today}",
             parse_mode='Markdown'
         )
         return
 
+    # Проверка активного premium
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
@@ -600,30 +639,31 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = datetime.fromisoformat(result[0])
         if datetime.now(MOSCOW_TZ) < expiry:
             expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
-            usage = get_smart_usage_today(user_id)
+            requests_today = get_user_requests_today(user_id)
             await update.message.reply_text(
                 f"💎 **Premium активен**\n\n"
-                f"✅ Безлимитный умный режим\n"
+                f"✅ Безлимитные запросы\n"
                 f"📅 Действует до: {expiry_str}\n"
-                f"📊 Использовано сегодня: {usage}",
+                f"📊 Использовано сегодня: {requests_today}",
                 parse_mode='Markdown'
             )
             return
 
-    usage = get_smart_usage_today(user_id)
-    remaining = max(0, SMART_DAILY_LIMIT - usage)
+    # Информация о покупке для обычного пользователя
+    requests_today = get_user_requests_today(user_id)
+    remaining = max(0, DAILY_LIMIT - requests_today)
 
     keyboard = [[InlineKeyboardButton("💎 Купить Premium за ⭐ " + str(PREMIUM_PRICE_STARS), callback_data="buy_premium")]]
 
     await update.message.reply_text(
         f"💎 **Tyler Premium**\n\n"
         f"✨ Что получишь:\n"
-        f"• Безлимитный доступ к умному режиму\n"
+        f"• Безлимитные запросы к боту\n"
         f"• Полная мощь gpt-5.1\n"
         f"• Без ограничений 24/7\n\n"
         f"⏰ Срок: 30 дней\n"
         f"💫 Цена: {PREMIUM_PRICE_STARS} звезд\n\n"
-        f"📊 Сейчас доступно: {remaining}/{SMART_DAILY_LIMIT} запросов в день",
+        f"📊 Сейчас доступно: {remaining}/{DAILY_LIMIT} запросов в день",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
@@ -639,7 +679,7 @@ async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_invoice(
         chat_id=query.message.chat_id,
         title="Tyler Premium",
-        description="Безлимитный доступ к умному режиму на 30 дней",
+        description="Безлимитные запросы на 30 дней",
         payload="premium_subscription",
         provider_token="",  # Пустой токен для Telegram Stars
         currency="XTR",  # Telegram Stars
@@ -669,11 +709,21 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
     await update.message.reply_text(
         f"🎉 **Premium активирован!**\n\n"
-        f"✅ Безлимитный умный режим\n"
+        f"✅ Безлимитные запросы\n"
         f"📅 Действует до: {expiry_str}\n\n"
         f"Давай, действуй!",
         parse_mode='Markdown'
     )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на inline кнопки"""
+    query = update.callback_query
+    await query.answer()
+
+    # Обработка покупки Premium
+    if query.data == "buy_premium":
+        await buy_premium_callback(update, context)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -690,99 +740,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_exists(user_id)
     logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
 
-    # Проверяем, не нажал ли пользователь кнопку переключения режима
-    if user_message in ["🧠 Умный Тайлер", "💬 Глупый Тайлер"]:
-        current_mode = get_user_mode(user_id)
-
-        # Переключаем режим
-        new_mode = 'smart' if current_mode == 'dumb' else 'dumb'
-
-        # Проверяем доступность умного режима
-        if new_mode == 'smart':
-            can_smart, msg = can_use_smart(user_id)
-            if not can_smart:
-                keyboard = get_mode_keyboard(user_id)
-                await update.message.reply_text(
-                    f"⛔ {msg}\n\n💎 /premium - Безлимитный доступ",
-                    reply_markup=keyboard
-                )
-                track_bot_message()
-                return
-
-        set_user_mode(user_id, new_mode)
-
-        # Отправляем подтверждение
-        mode_emoji = "🧠" if new_mode == 'smart' else "💬"
-        mode_name = "Умный" if new_mode == 'smart' else "Глупый"
-        model_name = "gpt-5.1" if new_mode == 'smart' else "gpt-4"
-
-        status_msg = ""
-        if new_mode == 'smart':
-            if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
-                status_msg = "\n👑 Безлимитный доступ (Admin)"
-            elif is_premium(user_id):
-                status_msg = "\n✅ Безлимитный доступ (Premium)"
-            else:
-                usage = get_smart_usage_today(user_id)
-                remaining = SMART_DAILY_LIMIT - usage
-                status_msg = f"\n📊 Осталось запросов сегодня: {remaining}/{SMART_DAILY_LIMIT}"
-
-        keyboard = get_mode_keyboard(user_id)
+    # Проверка лимита запросов
+    can_request, msg, remaining = can_make_request(user_id)
+    if not can_request:
         await update.message.reply_text(
-            f"{mode_emoji} Режим переключен: **{mode_name} Тайлер** ({model_name}){status_msg}",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
+            f"⛔ {msg}\n\n"
+            f"💎 Получи безлимит: /premium"
         )
         track_bot_message()
         return
 
-    # Обычное сообщение - используем текущий режим
-    current_mode = get_user_mode(user_id)
+    # Показываем индикатор набора текста
+    await update.message.chat.send_action('typing')
 
-    # Определяем модель
-    if current_mode == 'smart':
-        can_smart, msg = can_use_smart(user_id)
-        if not can_smart:
-            keyboard = get_mode_keyboard(user_id)
+    try:
+        # Добавляем сообщение пользователя в историю
+        add_to_history(user_id, 'user', user_message)
+
+        # Получаем историю диалога
+        history = get_user_history(user_id)
+
+        # Отправляем запрос к gpt-5.1 с полной историей
+        response = await send_to_chatgpt(history, model='gpt-5.1')
+
+        # Проверка на пустой ответ
+        if response is None:
+            # API исчерпал токены на reasoning (o1/o3 модели)
+            logger.error(f'API исчерпал токены на размышления для пользователя {user_id}')
             await update.message.reply_text(
-                f"⛔ {msg}",
-                reply_markup=keyboard
+                '❌ Модель слишком долго размышляла и исчерпала лимит токенов.\n\n'
+                'Попробуй задать вопрос проще или короче.'
             )
             track_bot_message()
             return
 
-        model = 'gpt-5.1'
-        increment_smart_usage(user_id)
-    else:
-        model = 'gpt-4'
+        if not response.strip():
+            logger.error(f'Пустой ответ от API для пользователя {user_id}')
+            await update.message.reply_text('❌ Получен пустой ответ от AI. Попробуй ещё раз.')
+            track_bot_message()
+            return
 
-    await update.message.chat.send_action('typing')
-
-    try:
-        add_to_history(user_id, 'user', user_message)
-        history = get_user_history(user_id)
-        response = await send_to_chatgpt(history, model=model)
+        # Добавляем ответ ассистента в историю
         add_to_history(user_id, 'assistant', response)
 
-        keyboard = get_mode_keyboard(user_id)
-        await update.message.reply_text(response, reply_markup=keyboard)
+        # Логируем успешный запрос
+        log_request(user_id)
+
+        # Отправляем ответ пользователю
+        await update.message.reply_text(response)
         track_bot_message()
 
     except Exception as e:
         logger.error(f'Ошибка: {e}')
-        keyboard = get_mode_keyboard(user_id)
-        await update.message.reply_text('❌ Что-то сломалось. Попробуй через минуту.', reply_markup=keyboard)
+        await update.message.reply_text('❌ Что-то сломалось. Попробуй через минуту.')
         track_bot_message()
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на inline кнопки"""
-    query = update.callback_query
-    await query.answer()
-
-    # Обработка покупки Premium
-    if query.data == "buy_premium":
-        await buy_premium_callback(update, context)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
