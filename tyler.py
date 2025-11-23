@@ -54,7 +54,7 @@ bot_message_times = []
 
 # Админ и лимиты
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0')) if os.getenv('ADMIN_USER_ID') else None
-DAILY_LIMIT = 3  # Бесплатных запросов в календарные сутки
+DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', '3'))  # Бесплатных запросов в календарные сутки
 PREMIUM_PRICE_STARS = int(os.getenv('PREMIUM_PRICE_STARS', '500'))  # Цена подписки в звездах
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
