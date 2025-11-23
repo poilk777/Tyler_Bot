@@ -279,7 +279,7 @@ async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
         'model': model,
         'messages': messages,
         'temperature': 0.9,
-        'max_completion_tokens': 800  # Ограничение для коротких ответов
+        'max_completion_tokens': 4000  # Увеличено для reasoning моделей (o1/o3)
     }
 
     try:
@@ -288,10 +288,17 @@ async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
                 if response.status == 200:
                     result = await response.json()
                     content = result['choices'][0]['message']['content']
+                    finish_reason = result['choices'][0].get('finish_reason')
 
-                    # Логируем если ответ пустой
+                    # Проверка на пустой ответ из-за лимита токенов
+                    if (not content or not content.strip()) and finish_reason == 'length':
+                        logger.warning(f'API исчерпал токены на reasoning. Full response: {result}')
+                        # Возвращаем специальное сообщение
+                        return None  # Будет обработано в handle_message
+
+                    # Логируем если ответ пустой по другой причине
                     if not content or not content.strip():
-                        logger.warning(f'API вернул пустой content. Full response: {result}')
+                        logger.warning(f'API вернул пустой content. Reason: {finish_reason}. Full response: {result}')
 
                     return content
                 else:
@@ -737,7 +744,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await send_to_chatgpt(history, model='gpt-5.1')
 
         # Проверка на пустой ответ
-        if not response or not response.strip():
+        if response is None:
+            # API исчерпал токены на reasoning (o1/o3 модели)
+            logger.error(f'API исчерпал токены на размышления для пользователя {user_id}')
+            await update.message.reply_text(
+                '❌ Модель слишком долго размышляла и исчерпала лимит токенов.\n\n'
+                'Попробуй задать вопрос проще или короче.'
+            )
+            track_bot_message()
+            return
+
+        if not response.strip():
             logger.error(f'Пустой ответ от API для пользователя {user_id}')
             await update.message.reply_text('❌ Получен пустой ответ от AI. Попробуй ещё раз.')
             track_bot_message()
