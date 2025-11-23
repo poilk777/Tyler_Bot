@@ -278,7 +278,7 @@ async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
     data = {
         'model': model,
         'messages': messages,
-        'temperature': 0.9,
+        'temperature': 1,
         'max_completion_tokens': 4000  # Увеличено для reasoning моделей (o1/o3)
     }
 
@@ -761,7 +761,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = get_user_history(user_id)
 
         # Отправляем запрос к gpt-5.1 с полной историей
-        response = await send_to_chatgpt(history, model='gpt-5.1')
+        response = await send_to_chatgpt(history, model='gpt-5-nano')
 
         # Проверка на пустой ответ
         if response is None:
