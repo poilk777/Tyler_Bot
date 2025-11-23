@@ -287,7 +287,13 @@ async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
             async with session.post(PROXYAPI_URL, json=data, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result['choices'][0]['message']['content']
+                    content = result['choices'][0]['message']['content']
+
+                    # Логируем если ответ пустой
+                    if not content or not content.strip():
+                        logger.warning(f'API вернул пустой content. Full response: {result}')
+
+                    return content
                 else:
                     error_text = await response.text()
                     logger.error(f'Ошибка ProxyAPI: {response.status} - {error_text}')
@@ -729,6 +735,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Отправляем запрос к gpt-5.1 с полной историей
         response = await send_to_chatgpt(history, model='gpt-5.1')
+
+        # Проверка на пустой ответ
+        if not response or not response.strip():
+            logger.error(f'Пустой ответ от API для пользователя {user_id}')
+            await update.message.reply_text('❌ Получен пустой ответ от AI. Попробуй ещё раз.')
+            track_bot_message()
+            return
 
         # Добавляем ответ ассистента в историю
         add_to_history(user_id, 'assistant', response)
