@@ -11,6 +11,7 @@ import os
 import sqlite3
 import time
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -67,6 +68,16 @@ def init_db():
         )
     ''')
 
+    # Таблица логов запросов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS request_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -119,6 +130,48 @@ def ensure_user_exists(user_id: int):
     cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
     conn.commit()
     conn.close()
+
+
+def log_request(user_id: int):
+    """Логирование запроса пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO request_logs (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_requests_last_24h() -> int:
+    """Получение количества запросов за последние 24 часа"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_24h_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute('SELECT COUNT(*) FROM request_logs WHERE timestamp >= ?', (time_24h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_unique_users_last_24h() -> int:
+    """Получение количества уникальных пользователей за последние 24 часа"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_24h_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM request_logs WHERE timestamp >= ?', (time_24h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_unique_users_last_hour() -> int:
+    """Получение количества уникальных пользователей за последний час"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    time_1h_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM request_logs WHERE timestamp >= ?', (time_1h_ago,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
 
 
 async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
@@ -399,8 +452,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stats"""
-    users_count = get_unique_users_count()
-    await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
+    user_id = update.effective_user.id
+
+    # Для админа - расширенная статистика
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        total_users = get_unique_users_count()
+        requests_24h = get_requests_last_24h()
+        users_24h = get_unique_users_last_24h()
+        users_1h = get_unique_users_last_hour()
+
+        stats_message = f"""📊 **Статистика бота (Admin)**
+
+👥 **Пользователи:**
+• Всего: {total_users}
+• За 24 часа: {users_24h}
+• За последний час: {users_1h}
+
+📈 **Запросы:**
+• За 24 часа: {requests_24h}
+
+⏰ Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}"""
+
+        await update.message.reply_text(stats_message, parse_mode='Markdown')
+    else:
+        # Для обычных пользователей - только общее количество
+        users_count = get_unique_users_count()
+        await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -432,6 +509,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Добавляем ответ ассистента в историю
         add_to_history(user_id, 'assistant', response)
+
+        # Логируем успешный запрос
+        log_request(user_id)
 
         # Отправляем ответ пользователю
         await update.message.reply_text(response)
