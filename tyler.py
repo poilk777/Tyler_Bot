@@ -13,10 +13,11 @@ import time
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters, ContextTypes
 import aiohttp
 from collections import defaultdict
+import pytz
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -51,8 +52,11 @@ user_message_times = defaultdict(list)  # Время сообщений поль
 # Счетчик сообщений бота
 bot_message_times = []
 
-# Админ
+# Админ и лимиты
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0')) if os.getenv('ADMIN_USER_ID') else None
+DAILY_LIMIT = 3  # Бесплатных запросов в календарные сутки
+PREMIUM_PRICE_STARS = int(os.getenv('PREMIUM_PRICE_STARS', '500'))  # Цена подписки в звездах
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 
 def init_db():
@@ -64,6 +68,7 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
+            premium_until TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -172,6 +177,91 @@ def get_unique_users_last_hour() -> int:
     count = cursor.fetchone()[0]
     conn.close()
     return count
+
+
+def get_current_date_msk() -> str:
+    """Получение текущей даты по МСК в формате YYYY-MM-DD"""
+    return datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
+
+
+def is_premium(user_id: int) -> bool:
+    """Проверка премиум статуса пользователя"""
+    # Админ всегда имеет премиум доступ
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+
+    if result and result[0]:
+        expiry = datetime.fromisoformat(result[0])
+        return datetime.now(MOSCOW_TZ) < expiry
+    return False
+
+
+def add_premium(user_id: int, months: int = 1):
+    """Добавление премиум подписки пользователю"""
+    ensure_user_exists(user_id)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+
+    current_expiry = None
+    if result and result[0]:
+        current_expiry = datetime.fromisoformat(result[0])
+
+    if current_expiry and current_expiry > datetime.now(MOSCOW_TZ):
+        new_expiry = current_expiry + timedelta(days=30 * months)
+    else:
+        new_expiry = datetime.now(MOSCOW_TZ) + timedelta(days=30 * months)
+
+    cursor.execute('UPDATE users SET premium_until = ? WHERE user_id = ?',
+                   (new_expiry.isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_user_requests_today(user_id: int) -> int:
+    """Получение количества запросов пользователя за текущие календарные сутки (по МСК)"""
+    today = get_current_date_msk()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*) FROM request_logs
+        WHERE user_id = ?
+        AND date(timestamp) = ?
+    ''', (user_id, today))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def can_make_request(user_id: int) -> tuple[bool, str, int]:
+    """
+    Проверка возможности сделать запрос.
+    Возвращает (можно, сообщение, осталось_запросов)
+    """
+    # Админ
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True, "Безлимитный доступ (Admin)", 999
+
+    # Премиум
+    if is_premium(user_id):
+        return True, "Безлимитный доступ (Premium)", 999
+
+    # Обычный пользователь
+    requests_today = get_user_requests_today(user_id)
+    remaining = DAILY_LIMIT - requests_today
+
+    if requests_today < DAILY_LIMIT:
+        return True, f"Осталось запросов сегодня: {remaining}", remaining
+
+    return False, "Лимит исчерпан. Купи Premium через /premium", 0
 
 
 async def send_to_chatgpt(messages: list, model: str = 'gpt-5.1') -> str:
@@ -405,7 +495,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Я здесь чтобы дать тебе пинка под зад и КОНКРЕТНЫЙ план действий.
 
 Я - Умный Тайлер. Работаю на gpt-5.1.
-Без ограничений. Без лимитов.
+
+📊 Лимиты:
+• 3 запроса в день бесплатно
+• 💎 Premium - безлимит (/premium)
 
 Хочешь перемен? Задавай вопросы.
 Готов ныть? Иди нахуй.
@@ -441,8 +534,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 Мозги (книги, навыки)
 🗣️ Общение (девушки, друзья)
 
+ЛИМИТЫ:
+📊 3 запроса в день бесплатно
+💎 Premium - безлимит
+
 КОМАНДЫ:
 /start - В начало
+/premium - Купить безлимит
 /stats - Статистика
 
 Всё. Хватит читать. Действуй.
@@ -480,6 +578,121 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'📊 Уникальных пользователей: {users_count}')
 
 
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /premium"""
+    user_id = update.effective_user.id
+    ensure_user_exists(user_id)
+
+    # Проверка на админа
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        requests_today = get_user_requests_today(user_id)
+        await update.message.reply_text(
+            f"👑 **Admin доступ**\n\n"
+            f"✅ Безлимитные запросы\n"
+            f"📅 Бессрочно\n"
+            f"📊 Использовано сегодня: {requests_today}",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Проверка активного premium
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+
+    if result and result[0]:
+        expiry = datetime.fromisoformat(result[0])
+        if datetime.now(MOSCOW_TZ) < expiry:
+            expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
+            requests_today = get_user_requests_today(user_id)
+            await update.message.reply_text(
+                f"💎 **Premium активен**\n\n"
+                f"✅ Безлимитные запросы\n"
+                f"📅 Действует до: {expiry_str}\n"
+                f"📊 Использовано сегодня: {requests_today}",
+                parse_mode='Markdown'
+            )
+            return
+
+    # Информация о покупке для обычного пользователя
+    requests_today = get_user_requests_today(user_id)
+    remaining = max(0, DAILY_LIMIT - requests_today)
+
+    keyboard = [[InlineKeyboardButton("💎 Купить Premium за ⭐ " + str(PREMIUM_PRICE_STARS), callback_data="buy_premium")]]
+
+    await update.message.reply_text(
+        f"💎 **Tyler Premium**\n\n"
+        f"✨ Что получишь:\n"
+        f"• Безлимитные запросы к боту\n"
+        f"• Полная мощь gpt-5.1\n"
+        f"• Без ограничений 24/7\n\n"
+        f"⏰ Срок: 30 дней\n"
+        f"💫 Цена: {PREMIUM_PRICE_STARS} звезд\n\n"
+        f"📊 Сейчас доступно: {remaining}/{DAILY_LIMIT} запросов в день",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик покупки Premium"""
+    query = update.callback_query
+    await query.answer()
+
+    prices = [LabeledPrice("Tyler Premium (30 дней)", PREMIUM_PRICE_STARS)]
+
+    await context.bot.send_invoice(
+        chat_id=query.message.chat_id,
+        title="Tyler Premium",
+        description="Безлимитные запросы на 30 дней",
+        payload="premium_subscription",
+        provider_token="",  # Пустой токен для Telegram Stars
+        currency="XTR",  # Telegram Stars
+        prices=prices
+    )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик пре-проверки платежа"""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик успешной оплаты"""
+    user_id = update.effective_user.id
+    add_premium(user_id, months=1)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT premium_until FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+
+    expiry = datetime.fromisoformat(result[0])
+    expiry_str = expiry.strftime('%d.%m.%Y %H:%M МСК')
+
+    await update.message.reply_text(
+        f"🎉 **Premium активирован!**\n\n"
+        f"✅ Безлимитные запросы\n"
+        f"📅 Действует до: {expiry_str}\n\n"
+        f"Давай, действуй!",
+        parse_mode='Markdown'
+    )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на inline кнопки"""
+    query = update.callback_query
+    await query.answer()
+
+    # Обработка покупки Premium
+    if query.data == "buy_premium":
+        await buy_premium_callback(update, context)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
@@ -493,6 +706,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Добавляем пользователя в БД
     ensure_user_exists(user_id)
     logger.info(f'Уникальных пользователей: {get_unique_users_count()}')
+
+    # Проверка лимита запросов
+    can_request, msg, remaining = can_make_request(user_id)
+    if not can_request:
+        await update.message.reply_text(
+            f"⛔ {msg}\n\n"
+            f"💎 Получи безлимит: /premium"
+        )
+        track_bot_message()
+        return
 
     # Показываем индикатор набора текста
     await update.message.chat.send_action('typing')
@@ -539,6 +762,14 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('stats', stats_command))
+    application.add_handler(CommandHandler('premium', premium_command))
+
+    # Callback кнопки
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Платежи
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
     # Текстовые сообщения
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
