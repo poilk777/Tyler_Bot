@@ -803,6 +803,17 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота"""
+    # Проверка наличия обязательных переменных окружения
+    if not TELEGRAM_TOKEN:
+        logger.error('❌ TELEGRAM_TOKEN не установлен!')
+        logger.error('Создайте файл .env на основе .env.example и добавьте ваш токен от @BotFather')
+        raise ValueError('TELEGRAM_TOKEN не может быть пустым. Создайте .env файл с вашим токеном.')
+
+    if not PROXYAPI_KEY:
+        logger.error('❌ PROXYAPI_KEY не установлен!')
+        logger.error('Создайте файл .env на основе .env.example и добавьте ваш ключ ProxyAPI')
+        raise ValueError('PROXYAPI_KEY не может быть пустым. Создайте .env файл с вашим ключом.')
+
     # Инициализация базы данных
     init_db()
 
